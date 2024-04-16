@@ -211,6 +211,14 @@ def zgr(logits, sample):
     return one_hot + (zgr_est - zgr_est.detach())
 
 
+def orthogonal_rms_(tensor, gain=1):
+    if tensor.ndim != 2:
+        raise ValueError("Only 2D matrices are supported")
+    o, i = tensor.shape
+    gain = gain * max(1, math.sqrt(o / i))
+    return nn.init.orthogonal_(tensor, gain=gain)
+
+
 def delta_orthogonal_(tensor, gain=1):
     spatial = tensor.shape[2:]
     if not all(d % 2 == 1 for d in spatial):
@@ -218,8 +226,17 @@ def delta_orthogonal_(tensor, gain=1):
     mid = [d // 2 for d in spatial]
     idx = (slice(None), slice(None), *mid)
     nn.init.zeros_(tensor)
-    nn.init.orthogonal_(tensor[idx], gain=gain)
-    return tensor
+    return nn.init.orthogonal_(tensor[idx], gain=gain)
+
+
+def delta_orthogonal_rms_(tensor, gain=1):
+    spatial = tensor.shape[2:]
+    if not all(d % 2 == 1 for d in spatial):
+        raise ValueError("All spatial dimensions must be odd")
+    mid = [d // 2 for d in spatial]
+    idx = (slice(None), slice(None), *mid)
+    nn.init.zeros_(tensor)
+    return orthogonal_rms_(tensor[idx], gain=gain)
 
 
 class QuantizerSelfAttention(nn.Module):

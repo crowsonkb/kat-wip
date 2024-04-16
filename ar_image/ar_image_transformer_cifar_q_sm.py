@@ -434,7 +434,7 @@ def main():
             x = dequantize(x, palette)
             x = rearrange(x, "(nh nw) (h w) d -> d (nh h) (nw w)", nh=10, nw=10, h=32, w=32)
             x = torch.clamp(x, 0, 1)
-            TF.to_pil_image(x.cpu()).save(f"demo_cifar_q_sm_078_{epoch:04}_{step:05}.png")
+            TF.to_pil_image(x.cpu()).save(f"demo_cifar_q_sm_079_{epoch:04}_{step:05}.png")
 
     while True:
         sampler.set_epoch(epoch)
@@ -470,13 +470,14 @@ def main():
             v_m = torch.logsumexp(logits_m, dim=-1)
             # loss = (v_d[..., :-1] - v_m[..., 1:]) / 2 + (v_d[..., :-1] - v_d[..., 1:]) / 2 - (q_d[..., :-1] - v_d[..., 1:]) / 2 - (q_d[..., :-1] - v_m[..., 1:]) / 2
             alpha = 0.1
-            phi = lambda x: x - alpha * x**2 / 4
-            psi = lambda x: -alpha * x**2 / 4
-            qv_d = -phi(q_d[..., :-1] - v_d[..., 1:])
-            qv_m = -psi(q_m[..., :-1] - v_m[..., 1:])
-            v_thing_d = v_d[..., :-1] - v_d[..., 1:]
-            v_thing_m = v_d[..., :-1] - v_m[..., 1:]
-            losses = qv_d.sum(-1) + qv_m.sum(-1) + v_thing_d.sum(-1) / 2 + v_thing_m.sum(-1) / 2
+            # phi = lambda x: x - alpha * x**2 / 4
+            # psi = lambda x: -alpha * x**2 / 4
+            # qv_d = -phi(q_d[..., :-1] - v_d[..., 1:])
+            # qv_m = -psi(q_m[..., :-1] - v_m[..., 1:])
+            # v_thing_d = v_d[..., :-1] - v_d[..., 1:]
+            # v_thing_m = v_d[..., :-1] - v_m[..., 1:]
+            # losses = qv_d.sum(-1) + qv_m.sum(-1) + v_thing_d.sum(-1) / 2 + v_thing_m.sum(-1) / 2
+            losses = -torch.sum(q_d[..., :-1] - v_d[..., 1:], dim=-1) + (v_d[..., 0] - v_d[..., -1]) / 2 + torch.sum(v_d[..., :-1] - v_m[..., 1:], dim=-1) / 2 / x_d.shape[-1]
             loss = torch.mean(losses) / x_d.shape[-1]
 
             opt.zero_grad()

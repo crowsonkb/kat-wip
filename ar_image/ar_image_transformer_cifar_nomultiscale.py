@@ -14,7 +14,7 @@ import torch.distributed.nn as dnn
 from torch.nn import functional as F
 from torch.utils import data
 import torch_dist_utils as du
-from torchvision import datasets, transforms
+from torchvision import datasets
 from torchvision.transforms import functional as TF
 from tqdm import trange, tqdm
 
@@ -190,11 +190,11 @@ class Transformer(nn.Module):
         self.head_dim = head_dim
         self.n_heads = dim // head_dim
         self.class_embed = nn.Embedding(10, dim)
-        self.image_embed = DMoELinear(256, dim, 3)
+        self.image_embed = DMoELinear(256, dim, 3, bias=False)
         self.embed_drop = nn.Dropout(0.0)
         self.blocks = nn.ModuleList([Block(dim, hidden_dim, head_dim) for _ in range(depth)])
         self.out_norm = nn.LayerNorm((dim,))
-        self.out_proj = DMoELinear(dim, 256, 3)
+        self.out_proj = DMoELinear(dim, 256, 3, bias=False)
 
     def init_cache(self, batch_size, seq_len, dtype=None, device=None):
         cache = [[] for _ in range(self.depth)]
@@ -290,7 +290,7 @@ def main():
             x = rearrange(x, "(nh nw) (h w d) -> d (nh h) (nw w)", nh=10, nw=10, h=32, w=32, d=3)
             x = x.float() / 255
             x = torch.clamp(x, 0, 1)
-            TF.to_pil_image(x.cpu()).save(f"demo_cifar_018_{epoch:04}_{step:05}.png")
+            TF.to_pil_image(x.cpu()).save(f"demo_cifar_019_{epoch:04}_{step:05}.png")
 
     while True:
         sampler.set_epoch(epoch)

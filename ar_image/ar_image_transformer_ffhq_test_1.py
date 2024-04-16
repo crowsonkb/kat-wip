@@ -7,6 +7,8 @@ import math
 from pathlib import Path
 
 from einops import rearrange
+import flash_attn
+from flash_attn.layers import rotary
 from ldm.util import instantiate_from_config
 from omegaconf import OmegaConf
 from PIL import Image
@@ -75,30 +77,6 @@ def checkpoint(func, *args, enable=False, **kwargs):
     if enable:
         return torch.utils.checkpoint.checkpoint(func, *args, use_reentrant=use_reentrant, **kwargs)
     return func(*args, **kwargs)
-
-
-def sm_loss_test(logits_d, logits_m, actions, seq_len, alpha=1.0):
-    assert logits_d.shape == logits_m.shape
-
-    def phi(x):
-        return x - alpha * x**2 / 4
-
-    i = torch.arange(1, logits_d.shape[-2] + 1, device=logits_d.device)
-    gamma = seq_len / (seq_len + 1)
-    gamma_i = gamma**i
-    q = logits_d.gather(-1, actions[..., None])[..., 0]
-    v_d = torch.logsumexp(logits_d, dim=-1)
-    v_m = torch.logsumexp(logits_m, dim=-1)
-
-    qv_diff = gamma_i[..., :-1] * phi(q[..., :-1] - gamma * v_d[..., 1:])
-    qv_diff_eos = gamma_i[..., -1] * phi((1 - gamma) * v_d[..., -1]) / (1 - gamma)
-    v_diff_d = gamma_i[..., :-1] * (v_d[..., :-1] - gamma * v_d[..., 1:]) / 2
-    v_diff_d_eos = gamma_i[..., -1] * v_d[..., -1] / 2
-    v_diff_m = gamma_i[..., :-1] * (v_m[..., :-1] - gamma * v_m[..., 1:]) / 2
-    v_diff_m_eos = gamma_i[..., -1] * v_m[..., -1] / 2
-    loss = v_diff_d.sum(-1) + v_diff_d_eos + v_diff_m.sum(-1) + v_diff_m_eos - qv_diff.sum(-1) - qv_diff_eos
-
-    return torch.mean(loss) / seq_len
 
 
 class EMAWarmup:
@@ -224,8 +202,25 @@ def load_vqgan_model(config_path, checkpoint_path):
 
 
 def sample_categorical(logits, tau=1.0):
-    gumbel = torch.rand_like(logits).log_().nan_to_num_().neg_().log_().neg_()
+    gumbel = torch.empty_like(logits).exponential_().log_().neg_()
     return torch.argmax(logits + gumbel * tau, dim=-1)
+
+
+def apply_top_p(logits, p):
+    """Returns logits with tokens not in the top p fraction of probability mass masked out."""
+    probs = torch.softmax(logits, dim=-1)
+    probs_sorted, indices = torch.sort(probs, dim=-1, descending=True, stable=True)
+    probs_cumsum = torch.cumsum(probs_sorted, dim=-1)
+    drop = probs_cumsum[..., :-1] >= p
+    drop = torch.cat((drop.new_zeros(*drop.shape[:-1], 1), drop), dim=-1)
+    drop_unsorted = torch.empty_like(drop).scatter_(-1, indices, drop)
+    return torch.masked_fill(logits, drop_unsorted, float("-inf"))
+
+
+def cross_entropy_loss(logits, targets):
+    q = logits.gather(-1, targets[..., None])[..., 0]
+    v = torch.logsumexp(logits, dim=-1)
+    return torch.mean(v - q)
 
 
 # TODO: do this correctly instead
@@ -277,60 +272,6 @@ class RMSNorm(nn.Module):
         return rms_norm(x, self.scale, self.eps)
 
 
-# @compile_wrap
-def apply_rotary_emb(x, theta, conj=False):
-    out_dtype = x.dtype
-    dtype = reduce(torch.promote_types, (x.dtype, theta.dtype, torch.float32))
-    d = theta.shape[-1]
-    assert d * 2 <= x.shape[-1]
-    x1, x2, x3 = x[..., :d], x[..., d : d * 2], x[..., d * 2 :]
-    x1, x2, theta = x1.to(dtype), x2.to(dtype), theta.to(dtype)
-    cos, sin = torch.cos(theta), torch.sin(theta)
-    sin = -sin if conj else sin
-    y1 = x1 * cos - x2 * sin
-    y2 = x2 * cos + x1 * sin
-    y1, y2 = y1.to(out_dtype), y2.to(out_dtype)
-    return torch.cat((y1, y2, x3), dim=-1)
-
-
-@compile_wrap
-def _apply_rotary_emb_inplace(x, theta, conj):
-    dtype = reduce(torch.promote_types, (x.dtype, theta.dtype, torch.float32))
-    d = theta.shape[-1]
-    assert d * 2 <= x.shape[-1]
-    x1, x2 = x[..., :d], x[..., d : d * 2]
-    x1_, x2_, theta = x1.to(dtype), x2.to(dtype), theta.to(dtype)
-    cos, sin = torch.cos(theta), torch.sin(theta)
-    sin = -sin if conj else sin
-    y1 = x1_ * cos - x2_ * sin
-    y2 = x2_ * cos + x1_ * sin
-    x1.copy_(y1)
-    x2.copy_(y2)
-
-
-class ApplyRotaryEmbeddingInplace(torch.autograd.Function):
-    @staticmethod
-    def forward(x, theta, conj):
-        _apply_rotary_emb_inplace(x, theta, conj=conj)
-        return x
-
-    @staticmethod
-    def setup_context(ctx, inputs, output):
-        _, theta, conj = inputs
-        ctx.save_for_backward(theta)
-        ctx.conj = conj
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        theta, = ctx.saved_tensors
-        _apply_rotary_emb_inplace(grad_output, theta, conj=not ctx.conj)
-        return grad_output, None, None
-
-
-def apply_rotary_emb_(x, theta):
-    return ApplyRotaryEmbeddingInplace.apply(x, theta, False)
-
-
 class SelfAttention(nn.Module):
     def __init__(self, dim, head_dim, dropout):
         super().__init__()
@@ -342,7 +283,7 @@ class SelfAttention(nn.Module):
         self.out_proj = zero_init(nn.Linear(dim, dim, bias=False))
         log_min = math.log(math.pi)
         log_max = math.log(10 * math.pi)
-        freqs = torch.linspace(log_min, log_max, head_dim // 4).exp()
+        freqs = torch.linspace(log_min, log_max, head_dim // 8).exp()
         # TODO: allow changing image size
         pos = make_axial_pos(32, 32)
         # make room for the class token
@@ -351,40 +292,32 @@ class SelfAttention(nn.Module):
         theta_h = pos[..., 0:1] * freqs
         theta_w = pos[..., 1:2] * freqs
         theta = torch.cat((theta_h, theta_w), dim=-1)
-        self.register_buffer("theta", theta)
+        self.register_buffer("cos", torch.cos(theta))
+        self.register_buffer("sin", torch.sin(theta))
 
-    def forward(self, x, cache=None, index=None, sm_mode=False):
+    def forward(self, x, cache=None, index=None):
         skip = x
         x = self.norm(x)
         qkv = self.qkv_proj(x).view(*x.shape[:2], 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.transpose(1, 3).unbind(2)
-        if sm_mode:
-            q = apply_rotary_emb(q, self.theta[:q.shape[-2]])
-            k = apply_rotary_emb(k, self.theta[:k.shape[-2]])
-            k_tmp = torch.cat((cache[0], k), dim=-2)
-            v_tmp = torch.cat((cache[1], v), dim=-2)
-            n = x.shape[-2]
-            cache_part = torch.ones((n, n), dtype=torch.bool, device=x.device).tril(-1)
-            main_part = torch.eye(n, dtype=torch.bool, device=x.device)
-            mask = torch.cat((cache_part, main_part), dim=-1)
-            x = F.scaled_dot_product_attention(q, k_tmp, v_tmp, mask, self.dropout_p if self.training else 0)
-        elif index is None:
-            q = apply_rotary_emb(q, self.theta[:q.shape[-2]])
-            k = apply_rotary_emb(k, self.theta[:k.shape[-2]])
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout_p if self.training else 0, is_causal=True)
-            if cache is not None:
-                cache[0][:, :, :x.shape[-2]] = k
-                cache[1][:, :, :x.shape[-2]] = v
+        if cache is None:
+            qkv = rotary.apply_rotary_emb_qkv_(qkv, self.cos.to(qkv), self.sin.to(qkv))
+            x = flash_attn.flash_attn_qkvpacked_func(qkv, self.dropout_p if self.training else 0, causal=True)
         else:
             assert not (x.shape[1] > 1 and index != 0)
             end_index = index + x.shape[1]
-            q = apply_rotary_emb_(q, self.theta[index:end_index])
-            k = apply_rotary_emb_(k, self.theta[index:end_index])
-            cache[0][:, :, index:end_index] = k
-            cache[1][:, :, index:end_index] = v
-            x = F.scaled_dot_product_attention(q, cache[0][:, :, :end_index], cache[1][:, :, :end_index])
-        x = x.transpose(1, 2)
-        x = x.reshape(*x.shape[:2], -1)
+            q, k, v = qkv.unbind(2)
+            q = rotary.apply_rotary_emb(
+                q, self.cos[index:end_index].to(q), self.sin[index:end_index].to(q), inplace=True
+            )
+            k = rotary.apply_rotary_emb(
+                k, self.cos[index:end_index].to(q), self.sin[index:end_index].to(q), inplace=True
+            )
+            cache[0][:, index:end_index] = k
+            cache[1][:, index:end_index] = v
+            x = flash_attn.flash_attn_func(
+                q, cache[0][:, :end_index], cache[1][:, :end_index], self.dropout_p if self.training else 0, causal=index == 0
+            )
+        x = x.view(*x.shape[:2], -1)
         x = self.out_proj(x)
         return x + skip
 
@@ -410,8 +343,8 @@ class Block(nn.Module):
         self.attn = SelfAttention(dim, head_dim, dropout)
         self.ff = FeedForward(dim, hidden_dim)
 
-    def forward(self, x, cache=None, index=None, sm_mode=False):
-        x = self.attn(x, cache, index, sm_mode)
+    def forward(self, x, cache=None, index=None):
+        x = self.attn(x, cache, index)
         x = self.ff(x)
         return x
 
@@ -430,6 +363,7 @@ class Transformer(nn.Module):
         self.blocks = nn.ModuleList([Block(dim, hidden_dim, head_dim, dropout) for _ in range(depth)])
         self.out_norm = RMSNorm((dim,))
         self.out_proj = nn.Linear(dim, 16384, bias=False)
+        self.image_embed.weight = self.out_proj.weight
 
     def init_cache(self, batch_size, seq_len, dtype=None, device=None):
         cache = [[] for _ in range(self.depth)]
@@ -438,8 +372,8 @@ class Transformer(nn.Module):
                 item.append(
                     torch.zeros(
                         batch_size,
-                        self.n_heads,
                         seq_len,
+                        self.n_heads,
                         self.head_dim,
                         dtype=dtype,
                         device=self.class_embed.weight.device if device is None else device,
@@ -447,19 +381,40 @@ class Transformer(nn.Module):
                 )
         return cache
 
-    def forward(self, x, y, cache=None, index=None, sm_mode=False):
+    def forward(self, x, y, cache=None, index=None):
         x = self.image_embed(x)
         y = self.class_embed(y)
         x = torch.cat((y[:, None], x), dim=1)
-        x = x[:, -1:].contiguous() if cache and index is not None and index > 0 else x
+        x = x[:, -1:].contiguous() if cache and index > 0 else x
         x = self.embed_drop(x)
         cache = [None] * self.depth if cache is None else cache
         for block, cache_block in zip(self.blocks, cache):
-            # x = checkpoint(block, x, cache_block, index, sm_mode, enable=False)
-            x = block(x, cache_block, index, sm_mode)
+            # x = checkpoint(block, x, cache_block, index, enable=self.training)
+            x = block(x, cache_block, index)
         x = self.out_norm(x)
         x = self.out_proj(x)
         return x
+
+
+def sm_loss(logits, targets):
+    def phi(x):
+        return x - x**2 / 4
+
+    n = logits.shape[-2]
+    gamma = n / (n + 1)
+    i = torch.arange(1, n + 1, device=logits.device)
+    gamma_i = gamma**i
+
+    q = logits.gather(-1, targets[..., None])[..., 0]
+    v = torch.logsumexp(logits, dim=-1)
+
+    qv_diff = -gamma_i[:-1] * phi(q[..., :-1] - gamma * v[..., 1:])
+    qv_eos = -gamma_i[-1] * phi((1 - gamma) * v[..., -1]) / (1 - gamma)
+    v_diff = gamma_i[:-1] * (v[..., :-1] - gamma * v[..., 1:])
+    v_eos = gamma_i[-1] * v[..., -1]
+
+    losses = torch.sum(qv_diff, dim=-1) + qv_eos + torch.sum(v_diff, dim=-1) + v_eos
+    return torch.mean(losses) / n
 
 
 def main():
@@ -470,8 +425,7 @@ def main():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    # config_path = "/home/kat/text-to-image/latent-diffusion/models/first_stage_models/vq-f16/config.yaml"
-    # model_path = "/home/kat/text-to-image/latent-diffusion/models/first_stage_models/vq-f16/model.ckpt"
+    # base_path = "/home/kat/text-to-image/latent-diffusion"
     base_path = "/weka/kat/ar_image/latent-diffusion"
     config_path = f"{base_path}/models/first_stage_models/vq-f16/config.yaml"
     model_path = f"{base_path}/models/first_stage_models/vq-f16/model.ckpt"
@@ -496,12 +450,12 @@ def main():
         x = ae.decode(x)
         return (x + 1) / 2
 
-    model_raw = Transformer(8, 512, 1360, 64, dropout=0.1).to(device)
-    # proj = nn.init.orthogonal_(torch.empty(8, 384, device=device), math.sqrt(384 / 8))
+    model_raw = Transformer(12, 768, 2048, 64, dropout=0.0).to(device)
     # with torch.no_grad():
+    #     proj = nn.init.orthogonal_(torch.empty(8, 512, device=device), math.sqrt(512 / 8))
     #     model_raw.image_embed.weight.copy_(ae.quantize.embedding.weight @ proj)
     du.broadcast_tensors(model_raw.parameters())
-    model_ema = deepcopy(model_raw)
+    model_ema = deepcopy(model_raw).eval().requires_grad_(False)
     print0(f"Parameters: {sum(p.numel() for p in model_raw.parameters()):,}")
     model = nn.parallel.DistributedDataParallel(
         model_raw, device_ids=[device], output_device=device
@@ -536,14 +490,16 @@ def main():
         else:
             wd.append(param)
     groups = [{"params": wd}, {"params": no_wd, "weight_decay": 0}]
-    opt = optim.AdamW(groups, lr=6e-4, betas=(0.9, 0.95), weight_decay=0.1)
+    opt = optim.AdamW(groups, lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)
+    sched = optim.lr_scheduler.LambdaLR(opt, lambda i: min(1, i / 1000))
     ema_sched = EMAWarmup(power=2 / 3, max_value=0.999)
 
     epoch = 0
     step = 0
 
     @torch.no_grad()
-    def sample(model, n, y, tau=1.0, disable=False):
+    def sample(model, y, tau=1.0, top_p=1.0, disable=False):
+        n = y.shape[0]
         n_proc = n // world_size
         x = torch.zeros(n_proc, 0, dtype=torch.long, device=device)
         y = y.split(n_proc)[rank]
@@ -552,6 +508,8 @@ def main():
         for _ in trange(32 * 32, disable=rank != 0 or disable):
             with torch.cuda.amp.autocast(dtype=torch.bfloat16), eval_mode(model):
                 logits = model(x, y, cache, index).float()
+            if top_p < 1.0:
+                logits = apply_top_p(logits, top_p)
             sample = sample_categorical(logits, tau=tau)
             x = torch.cat((x, sample), dim=1)
             index += 1
@@ -560,32 +518,30 @@ def main():
     def demo():
         y = torch.randint(1, (16,), device=device)
         dist.broadcast(y, 0)
-        x = sample(model_ema, 16, y, tau=1.0)
+        x = sample(model_ema, y, tau=1.0, top_p=0.99)
         x = rearrange(x, "b (h w) -> b h w", h=32, w=32)
         x = decode(x)
         if rank == 0:
             x = rearrange(x, "(nh nw) c h w -> c (nh h) (nw w)", nh=4, nw=4)
             x = torch.clamp(x, 0, 1)
-            TF.to_pil_image(x.cpu().float()).save(f"demo_ffhq_test_1_015_{step:07}.png")
+            TF.to_pil_image(x.cpu().float()).save(f"demo_ffhq_049_{step:07}.png")
 
     while True:
         sampler.set_epoch(epoch)
         for x, in tqdm(dataloader, disable=rank > 0):
-            if step % 1000 == 0:
+            if step > 0 and step % 2000 == 0:
                 demo()
             x = x.long().to(device)
             # x = encode(x)
             y = torch.full((x.shape[0],), 0, dtype=torch.long, device=device)
-            cache = model_raw.init_cache(batch_size, x.shape[-1], dtype=torch.bfloat16, device=device)
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                logits = model(x[:, :-1], y, cache).float()
-            x_m = sample_categorical(logits)
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                logits_m = model(x_m[:, :-1], y, cache, sm_mode=True).float()
-            loss = sm_loss_test(logits, logits_m, x, x.shape[-1])
+                logits = model(x[:, :-1], y)
+                loss = torch.compile(cross_entropy_loss)(logits, x)
+                # loss = torch.compile(sm_loss)(logits, x)
             opt.zero_grad()
             loss.backward()
             opt.step()
+            sched.step()
             ema_update(model_raw, model_ema, ema_sched.get_value())
             ema_sched.step()
             dist.all_reduce(loss, dist.ReduceOp.AVG)

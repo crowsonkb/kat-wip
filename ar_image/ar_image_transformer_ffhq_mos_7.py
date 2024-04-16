@@ -2,14 +2,19 @@
 
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import dataclass
 from functools import lru_cache, reduce, update_wrapper
 import math
+from pathlib import Path
 
 from einops import rearrange
 import flash_attn
 from flash_attn.layers import rotary
 from ldm.util import instantiate_from_config
+from megablocks import grouped_gemm_util as gg
 from omegaconf import OmegaConf
+from PIL import Image
+import safetensors.torch
 from taming.models import cond_transformer, vqgan
 import torch
 from torch import distributed as dist, nn, optim
@@ -17,12 +22,16 @@ import torch.distributed.nn as dnn
 from torch.nn import functional as F
 from torch.utils import data
 import torch_dist_utils as du
-from torchvision import datasets, transforms
+# from torchvision import datasets, transforms
 from torchvision.transforms import functional as TF
 from tqdm import trange, tqdm
 
+from sinkhorn import log_sinkhorn
+
 print = tqdm.external_write_mode()(print)
 print0 = tqdm.external_write_mode()(du.print0)
+
+gmm = torch.compiler.disable(gg.ops.gmm)
 
 
 @contextmanager
@@ -147,6 +156,32 @@ class compile_wrap:
         return self.compiled_function(*args, **kwargs)
 
 
+class FolderOfImages(data.Dataset):
+    """Recursively finds all images in a directory. It does not support
+    classes/targets."""
+
+    IMG_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif', '.tiff', '.webp'}
+
+    def __init__(self, root, transform=None):
+        super().__init__()
+        self.root = Path(root)
+        self.transform = nn.Identity() if transform is None else transform
+        self.paths = sorted(path for path in self.root.rglob('*') if path.suffix.lower() in self.IMG_EXTENSIONS)
+
+    def __repr__(self):
+        return f'FolderOfImages(root="{self.root}", len: {len(self)})'
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, key):
+        path = self.paths[key]
+        with open(path, 'rb') as f:
+            image = Image.open(f).convert('RGB')
+        image = self.transform(image)
+        return image,
+
+
 def load_vqgan_model(config_path, checkpoint_path):
     config = OmegaConf.load(config_path)
     if config.model.target == "taming.models.vqgan.VQModel":
@@ -172,27 +207,12 @@ def load_vqgan_model(config_path, checkpoint_path):
     return model
 
 
+def gumbel_like(x):
+    return torch.rand_like(x).log_().nan_to_num_().neg_().log_().neg_()
+
+
 def sample_categorical(logits, tau=1.0):
-    gumbel = torch.rand_like(logits).log_().nan_to_num_().neg_().log_().neg_()
-    return torch.argmax(logits + gumbel * tau, dim=-1)
-
-
-def apply_top_p(logits, p):
-    """Returns logits with tokens not in the top p fraction of probability mass masked out."""
-    probs = torch.softmax(logits, dim=-1)
-    probs_sorted, indices = torch.sort(probs, dim=-1, descending=True)
-    probs_cumsum = torch.cumsum(probs_sorted, dim=-1)
-    drop = probs_cumsum[..., :-1] >= p
-    drop = torch.cat((drop.new_zeros(*drop.shape[:-1], 1), drop), dim=-1)
-    drop_unsorted = torch.zeros_like(drop).scatter_(-1, indices, drop)
-    return torch.masked_fill(logits, drop_unsorted, float("-inf"))
-
-
-@compile_wrap
-def kl_divergence(logits_p, logits_q):
-    log_p = logits_p - torch.logsumexp(logits_p, dim=-1, keepdim=True)
-    log_q = logits_q - torch.logsumexp(logits_q, dim=-1, keepdim=True)
-    return torch.sum(torch.exp(log_p) * (log_p - log_q), dim=-1)
+    return torch.argmax(logits + gumbel_like(logits) * tau, dim=-1)
 
 
 # TODO: do this correctly instead
@@ -203,6 +223,12 @@ def make_axial_pos(h, w, dtype=None, device=None):
     h_pos = (h_pos[:-1] + h_pos[1:]) / 2
     w_pos = (w_pos[:-1] + w_pos[1:]) / 2
     return torch.stack(torch.meshgrid(h_pos, w_pos, indexing="ij"), dim=-1).view(h * w, 2)
+
+
+@compile_wrap
+def swiglu(x):
+    x, gate = x.chunk(2, dim=-1)
+    return x * F.silu(gate)
 
 
 @compile_wrap
@@ -244,25 +270,58 @@ class RMSNorm(nn.Module):
         return rms_norm(x, self.scale, self.eps)
 
 
-class AdaRMSNorm(nn.Module):
-    def __init__(self, features, cond_features, eps=1e-6):
+@dataclass
+class DMoEState:
+    shape: tuple[int, ...]
+    ids_sorted: torch.Tensor
+    ids_indices: torch.Tensor
+    batch_sizes: torch.Tensor
+
+
+class DMoELinear(nn.Module):
+    def __init__(self, in_features, out_features, n_experts, bias=True):
         super().__init__()
-        self.eps = eps
-        self.linear = zero_init(nn.Linear(cond_features, features, bias=False))
+        self.in_features = in_features
+        self.out_features = out_features
+        self.n_experts = n_experts
+        self.weight = nn.Parameter(torch.empty(n_experts, out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(n_experts, out_features)) if bias else None
+        with torch.no_grad():
+            for i in range(n_experts):
+                layer = nn.Linear(in_features, out_features, bias=bias)
+                self.weight[i].copy_(layer.weight)
+                if bias:
+                    self.bias[i].copy_(layer.bias)
 
-    def extra_repr(self):
-        return f"eps={self.eps},"
+    def preprocess(self, x, ids):
+        shape = x.shape[:-1]
+        x = x.flatten(0, -2)
+        ids = ids.flatten()
+        ids_sorted, ids_indices = torch.sort(ids)
+        x_sorted = x[ids_indices]
+        batch_sizes = torch.bincount(ids_sorted, minlength=self.n_experts).cpu()
+        state = DMoEState(shape, ids_sorted, ids_indices, batch_sizes)
+        return x_sorted, state
 
-    def forward(self, x, cond):
-        return rms_norm(x, self.linear(cond)[:, None, :] + 1, self.eps)
+    def postprocess(self, x, state):
+        x_real = torch.empty_like(x)
+        x_real.scatter_(0, state.ids_indices[..., None].expand_as(x), x)
+        return x_real.view(*state.shape, self.out_features)
+
+    def forward(self, x, state):
+        x = gmm(x.bfloat16(), self.weight.bfloat16(), state.batch_sizes, trans_b=True)
+        if self.bias is not None:
+            x += self.bias[state.ids_sorted].bfloat16()
+        return x
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim, head_dim):
+    def __init__(self, dim, head_dim, dropout):
         super().__init__()
         self.head_dim = head_dim
         self.n_heads = dim // head_dim
-        self.norm = AdaRMSNorm(dim, 256)
+        self.dropout_p = dropout
+        self.norm = RMSNorm((dim,))
         self.qkv_proj = nn.Linear(dim, dim * 3, bias=False)
         self.out_proj = zero_init(nn.Linear(dim, dim, bias=False))
         log_min = math.log(math.pi)
@@ -270,7 +329,8 @@ class SelfAttention(nn.Module):
         freqs = torch.linspace(log_min, log_max, head_dim // 8).exp()
         # TODO: allow changing image size
         pos = make_axial_pos(32, 32)
-        # make room for the first token
+        # make room for the class token
+        # TODO: use adanorm for this
         pos = torch.cat((torch.zeros(1, 2), pos))
         theta_h = pos[..., 0:1] * freqs
         theta_w = pos[..., 1:2] * freqs
@@ -278,13 +338,13 @@ class SelfAttention(nn.Module):
         self.register_buffer("cos", torch.cos(theta))
         self.register_buffer("sin", torch.sin(theta))
 
-    def forward(self, x, cond, cache=None, index=None):
+    def forward(self, x, cache=None, index=None):
         skip = x
-        x = self.norm(x, cond)
+        x = self.norm(x)
         qkv = self.qkv_proj(x).view(*x.shape[:2], 3, self.n_heads, self.head_dim)
         if cache is None:
             qkv = rotary.apply_rotary_emb_qkv_(qkv, self.cos.to(qkv), self.sin.to(qkv))
-            x = flash_attn.flash_attn_qkvpacked_func(qkv, causal=True)
+            x = flash_attn.flash_attn_qkvpacked_func(qkv, self.dropout_p if self.training else 0, causal=True)
         else:
             assert not (x.shape[1] > 1 and index != 0)
             end_index = index + x.shape[1]
@@ -298,7 +358,7 @@ class SelfAttention(nn.Module):
             cache[0][:, index:end_index] = k
             cache[1][:, index:end_index] = v
             x = flash_attn.flash_attn_func(
-                q, cache[0][:, :end_index], cache[1][:, :end_index], causal=index == 0
+                q, cache[0][:, :end_index], cache[1][:, :end_index], self.dropout_p if self.training else 0, causal=index == 0
             )
         x = x.view(*x.shape[:2], -1)
         x = self.out_proj(x)
@@ -308,45 +368,155 @@ class SelfAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
-        self.norm = AdaRMSNorm(dim, 256)
+        self.norm = RMSNorm((dim,))
         self.up = LinearSwiGLU(dim, hidden_dim, bias=False)
         self.down = zero_init(nn.Linear(hidden_dim, dim, bias=False))
 
-    def forward(self, x, cond):
+    def forward(self, x):
         skip = x
-        x = self.norm(x, cond)
+        x = self.norm(x)
         x = self.up(x)
         x = self.down(x)
         return x + skip
 
 
-class Block(nn.Module):
-    def __init__(self, dim, hidden_dim, head_dim):
+class Router(nn.Module):
+    def __init__(self, dim, n, k):
         super().__init__()
-        self.attn = SelfAttention(dim, head_dim)
-        self.ff = FeedForward(dim, hidden_dim)
+        self.n = n
+        self.k = k
+        self.linear = nn.Linear(dim, n, bias=False)
 
-    def forward(self, x, cond, cache=None, index=None):
-        x = self.attn(x, cond, cache, index)
-        x = self.ff(x, cond)
+    def forward(self, x):
+        scores = self.linear(x)
+        if self.training:
+            n, s, d = scores.shape
+            p = log_sinkhorn(scores.view(n * s, d), 10).view(n, s, d)
+            _, indices = torch.topk(p, self.k, dim=-1)
+            c = F.softmax(scores, dim=-1)
+            c = torch.gather(c, -1, indices)
+        else:
+            c = F.softmax(scores, dim=-1)
+            c, indices = torch.topk(c, self.k, dim=-1)
+        return indices, c
+
+
+class MoEFeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, n_experts, k):
+        super().__init__()
+        self.k = k
+        self.norm = RMSNorm((dim,))
+        self.router = Router(dim, n_experts, k)
+        self.up = DMoELinear(dim, hidden_dim * 2, n_experts, bias=False)
+        self.down = zero_init(DMoELinear(hidden_dim, dim, n_experts, bias=False))
+
+    def forward(self, x):
+        skip = x
+        x = self.norm(x)
+        ids, c = self.router(x)
+        x = x[..., None, :].expand(-1, -1, self.k, -1)
+        x, state = self.up.preprocess(x, ids)
+        x = self.up(x, state)
+        x = swiglu(x)
+        x = self.down(x, state)
+        x = self.down.postprocess(x, state)
+        x = torch.sum(x * c[..., None], dim=-2)
+        return x + skip
+
+
+class Block(nn.Module):
+    def __init__(self, dim, hidden_dim, head_dim, dropout):
+        super().__init__()
+        self.attn = SelfAttention(dim, head_dim, dropout)
+        self.ff = FeedForward(dim, hidden_dim)
+        # self.ff = MoEFeedForward(dim, hidden_dim, 8, 2)
+
+    def forward(self, x, cache=None, index=None):
+        x = self.attn(x, cache, index)
+        x = self.ff(x)
         return x
 
 
+class Router2(nn.Module):
+    def __init__(self, dim, n, k):
+        super().__init__()
+        self.n = n
+        self.k = k
+        self.linear = nn.Linear(dim, n, bias=False)
+
+    def forward(self, x):
+        scores = self.linear(x)
+        if self.training:
+            n, s, d = scores.shape
+            p = log_sinkhorn(scores.view(n * s, d), 10).view(n, s, d)
+            _, indices = torch.topk(p, self.k, dim=-1)
+            c = torch.gather(scores, -1, indices)
+        else:
+            c, indices = torch.topk(scores, self.k, dim=-1)
+        return indices, c
+
+
+class MoEHead2(nn.Module):
+    def __init__(self, dim, vocab_size, n, k):
+        super().__init__()
+        self.k = k
+        self.router = Router2(dim, n, k)
+        self.up = DMoELinear(dim, dim * 8 // 3 * 2, n, bias=False)
+        self.down = DMoELinear(dim * 8 // 3, dim, n, bias=False)
+        self.proj = DMoELinear(dim, vocab_size, n, bias=False)
+        with torch.no_grad():
+            for i in range(1, n):
+                self.proj.weight[i].copy_(self.proj.weight[0])
+
+    def forward(self, x):
+        ids, c = self.router(x)
+        x = x[..., None, :].expand(-1, -1, self.k, -1)
+        x, state = self.proj.preprocess(x, ids)
+        skip = x
+        x = self.up(x, state)
+        x = swiglu(x)
+        x = self.down(x, state)
+        x = x + skip
+        x = self.proj(x, state)
+        x = self.proj.postprocess(x, state)
+        c = F.softmax(c, dim=-1)
+        # c = c / c.sum(dim=-1, keepdim=True)
+        x = torch.sum(x * c[..., None], dim=-2)
+        # c = c - torch.logsumexp(c, dim=-1, keepdim=True)
+        # x = x - torch.logsumexp(x, dim=-1, keepdim=True)
+        # x = torch.logsumexp(x + c[..., None], dim=-2)
+        return x
+
+
+@compile_wrap
+def mixture_of_softmax(x, c):
+    c = c - torch.logsumexp(c, dim=-1, keepdim=True)
+    x = x - torch.logsumexp(x, dim=-1, keepdim=True)
+    return torch.logsumexp(x + c[..., None], dim=-2)
+
+
 class Transformer(nn.Module):
-    def __init__(self, depth, dim, hidden_dim, head_dim):
+    def __init__(self, depth, dim, hidden_dim, head_dim, dropout):
         super().__init__()
         self.depth = depth
         self.dim = dim
         self.hidden_dim = hidden_dim
         self.head_dim = head_dim
         self.n_heads = dim // head_dim
-        self.class_embed = nn.Embedding(1001, 256)
-        self.first_token = nn.Parameter(torch.randn(dim))
-        self.image_embed = nn.Embedding(8192, dim)
-        self.blocks = nn.ModuleList([Block(dim, hidden_dim, head_dim) for _ in range(depth)])
+        self.class_embed = nn.Embedding(1, dim)
+        # self.image_embed = nn.Embedding(16384, dim)
+        self.embed_drop = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList([Block(dim, hidden_dim, head_dim, dropout) for _ in range(depth)])
         self.out_norm = RMSNorm((dim,))
-        self.out_proj = nn.Linear(dim, 8192, bias=False)
-        self.image_embed.weight = self.out_proj.weight
+        # self.pad = nn.Parameter(torch.zeros(2, dim * 3))
+        # self.out_down = nn.Linear(dim * 9, dim, bias=False)
+        # self.out_head = nn.Linear(dim * 2, 16384, bias=False)
+        # self.out_head = nn.Linear(dim, 16384, bias=False)
+        # self.image_embed.weight = self.out_head.weight
+        # self.out_head = MLPHead(dim, 16384, dim * 4)
+        # self.out_head = MoEHead(dim, 16384, n_experts=3, k=3)
+        self.out_head = MoEHead2(dim, 16384, 8, 4)
+        self.out_head.compile()
 
     def init_cache(self, batch_size, seq_len, dtype=None, device=None):
         cache = [[] for _ in range(self.depth)]
@@ -365,16 +535,32 @@ class Transformer(nn.Module):
         return cache
 
     def forward(self, x, y, cache=None, index=None):
-        x = self.image_embed(x)
+        # x = self.image_embed(x)
+        x = F.embedding(x, self.out_head.proj.weight.mean(dim=0))
+        # x = F.embedding(x, self.out_head.weight[:, :self.dim])
         y = self.class_embed(y)
-        first_token = self.first_token[None, None, :].expand(x.shape[0], 1, -1)
-        x = torch.cat((first_token, x), dim=1)
+        x = torch.cat((y[:, None], x), dim=1)
         x = x[:, -1:].contiguous() if cache and index > 0 else x
+        x = self.embed_drop(x)
         cache = [None] * self.depth if cache is None else cache
+        # xs = []
         for block, cache_block in zip(self.blocks, cache):
-            x = checkpoint(block, x, y, cache_block, index, enable=self.training)
+            # x = checkpoint(block, x, cache_block, index, enable=self.training)
+            x = block(x, cache_block, index)
+            # xs.append(x)
+            # if len(xs) > 3:
+            #     xs.pop(0)
+        # x2 = torch.stack(xs, dim=-2)
+        # x2 = self.out_norm(x2)
+        # x = x2[..., -1, :]
+        # x2 = x2.flatten(-2)
+        # x2 = torch.cat((self.pad.expand(x.shape[0], -1, -1), x2), dim=-2)
+        # x2 = torch.cat((x2[:, :-2], x2[:, 1:-1], x2[:, 2:]), dim=-1)
+        # x2 = self.out_down(x2)
+        # x2 = F.gelu(x2)
+        # x = torch.cat((x, x2), dim=-1)
         x = self.out_norm(x)
-        x = self.out_proj(x)
+        x = self.out_head(x)
         return x
 
 
@@ -386,30 +572,32 @@ def main():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    config_path = "/home/kat/text-to-image/vqgan_models/vqgan_gumbel_f8_8192.yaml"
-    model_path = "/home/kat/text-to-image/vqgan_models/vqgan_gumbel_f8_8192.ckpt"
+    base_path = "/home/kat/text-to-image/latent-diffusion"
+    # base_path = "/weka/kat/ar_image/latent-diffusion"
+    config_path = f"{base_path}/models/first_stage_models/vq-f16/config.yaml"
+    model_path = f"{base_path}/models/first_stage_models/vq-f16/model.ckpt"
     ae = load_vqgan_model(config_path, model_path).to(device)
     ae.eval().requires_grad_(False)
 
-    @compile_wrap
     @torch.no_grad()
     @torch.cuda.amp.autocast(dtype=torch.bfloat16)
     def encode(x):
+        bs = x.shape[0]
         x = x * 2 - 1
-        h = ae.encode_to_prequant(x)
-        h = ae.quantize.proj(h)
-        return h.movedim(1, 3)
-
-    @compile_wrap
-    @torch.no_grad()
-    @torch.cuda.amp.autocast(dtype=torch.bfloat16)
-    def decode(h):
-        h = ae.quantize.embed(h)
-        x = ae.decode(h.movedim(3, 1))
-        x = (x + 1) / 2
+        x, _, _ = ae.encode(x)
+        _, _, (_, _, x) = ae.quantize(x)
+        x = x.view(bs, -1)
         return x
 
-    model_raw = Transformer(12, 768, 2048, 64).to(device)
+    @torch.no_grad()
+    @torch.cuda.amp.autocast(dtype=torch.bfloat16)
+    def decode(x):
+        x = ae.quantize.embedding(x)
+        x = x.movedim(3, 1)
+        x = ae.decode(x)
+        return (x + 1) / 2
+
+    model_raw = Transformer(8, 512, 1360, 64, dropout=0.0).to(device)
     du.broadcast_tensors(model_raw.parameters())
     model_ema = deepcopy(model_raw).eval().requires_grad_(False)
     print0(f"Parameters: {sum(p.numel() for p in model_raw.parameters()):,}")
@@ -417,14 +605,8 @@ def main():
         model_raw, device_ids=[device], output_device=device
     )
 
-    transform = transforms.Compose(
-        [
-            transforms.Resize(256, transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(256),
-            transforms.ToTensor(),
-        ]
-    )
-    dataset = datasets.ImageFolder("/home/kat/datasets/ilsvrc2012/train", transform=transform)
+    data_tensors = safetensors.torch.load_file("ffhq_512_f16.safetensors")
+    dataset = data.TensorDataset(data_tensors["tokens"])
     sampler = data.distributed.DistributedSampler(
         dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
     )
@@ -432,7 +614,7 @@ def main():
         dataset,
         batch_size=batch_size,
         sampler=sampler,
-        num_workers=4,
+        num_workers=0,
         pin_memory=True,
         drop_last=True,
     )
@@ -444,62 +626,59 @@ def main():
         else:
             wd.append(param)
     groups = [{"params": wd}, {"params": no_wd, "weight_decay": 0}]
-    opt = optim.AdamW(groups, lr=5e-4, betas=(0.9, 0.95), weight_decay=0.01)
-    sched = optim.lr_scheduler.LambdaLR(opt, lambda i: min(1, i / 100))
+    opt = optim.AdamW(groups, lr=6e-4, betas=(0.9, 0.95), weight_decay=0.1)
     ema_sched = EMAWarmup(power=2 / 3, max_value=0.999)
 
     epoch = 0
     step = 0
 
     @torch.no_grad()
-    def sample(model, y, tau=1.0, top_p=1.0, cfg_scale=1.0, disable=False):
+    def sample(model, y, tau=1.0, disable=False):
         n = y.shape[0]
         n_proc = n // world_size
         x = torch.zeros(n_proc, 0, dtype=torch.long, device=device)
         y = y.split(n_proc)[rank]
-        y_in = torch.cat((y, torch.full_like(y, 1000)))
-        cache = model_ema.init_cache(n_proc * 2, 32 * 32, dtype=torch.bfloat16, device=device)
+        cache = model.init_cache(n_proc, 32 * 32, dtype=torch.bfloat16, device=device)
         index = 0
+        entr_x = torch.zeros(n_proc, 0, dtype=torch.float32, device=device)
         for _ in trange(32 * 32, disable=rank != 0 or disable):
-            x_in = torch.cat((x, x))
             with torch.cuda.amp.autocast(dtype=torch.bfloat16), eval_mode(model):
-                logits_c, logits_u = model(x_in, y_in, cache, index).float().chunk(2)
-            logits = logits_u + (logits_c - logits_u) * cfg_scale
-            if top_p < 1.0:
-                logits = apply_top_p(logits, top_p)
+                logits = model(x, y, cache, index).float()
             sample = sample_categorical(logits, tau=tau)
             x = torch.cat((x, sample), dim=1)
+            logprobs = F.log_softmax(logits, dim=-1)
+            entr_tok = -torch.sum(logprobs.exp() * logprobs, dim=-1)
+            entr_x = torch.cat((entr_x, entr_tok), dim=1)
             index += 1
-        return torch.cat(dnn.all_gather(x))
+        x = torch.cat(dnn.all_gather(x))
+        entr_x = torch.cat(dnn.all_gather(entr_x))
+        return x, entr_x
 
     def demo():
-        y = torch.randint(1000, (36,), device=device)
+        y = torch.randint(1, (16,), device=device)
         dist.broadcast(y, 0)
-        x = sample(model_ema, y, tau=1.0, top_p=0.98, cfg_scale=2.0)
+        x, entr = sample(model_ema, y, tau=1.0)
+        print0(f"Mean policy entropy: {entr.mean().item():g}")
         x = rearrange(x, "b (h w) -> b h w", h=32, w=32)
         x = decode(x)
         if rank == 0:
-            x = rearrange(x, "(nh nw) c h w -> c (nh h) (nw w)", nh=6, nw=6)
+            x = rearrange(x, "(nh nw) c h w -> c (nh h) (nw w)", nh=4, nw=4)
             x = torch.clamp(x, 0, 1)
-            TF.to_pil_image(x.float().cpu()).save(f"demo_imagenet_027_{step:07}.png")
+            TF.to_pil_image(x.cpu().float()).save(f"demo_ffhq_mos_7_001_{step:07}.png")
 
     while True:
         sampler.set_epoch(epoch)
-        for x, y in tqdm(dataloader, disable=rank > 0):
-            if step > 0 and step % 100 == 0:
+        for x, in tqdm(dataloader, disable=rank > 0):
+            if step % 500 == 0:
                 demo()
-            x, y = x.to(device), y.to(device)
-            x_logits = encode(x).flatten(1, 2).float()
-            y = torch.where(torch.rand_like(y, dtype=torch.float32) < 0.1, 1000, y)
-            x = sample_categorical(x_logits)
+            x = x.long().to(device)
+            y = torch.zeros(x.shape[0], dtype=torch.long, device=device)
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                logits = model(x[:, :-1], y).float()
-            # loss = F.cross_entropy(logits.mT, x)
-            loss = kl_divergence(x_logits, logits).mean()
+                logits = model(x[:, :-1], y)
+                loss = F.cross_entropy(logits.mT, x)
             opt.zero_grad()
             loss.backward()
             opt.step()
-            sched.step()
             ema_update(model_raw, model_ema, ema_sched.get_value())
             ema_sched.step()
             dist.all_reduce(loss, dist.ReduceOp.AVG)

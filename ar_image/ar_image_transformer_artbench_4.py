@@ -332,6 +332,36 @@ class Block(nn.Module):
         return x
 
 
+@torch.compile
+def mixture_of_softmax(logits, scores):
+    logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+    scores = scores - torch.logsumexp(scores, dim=-1, keepdim=True)
+    return torch.logsumexp(logits + scores[..., None], dim=-2)
+
+
+@torch.compile
+def mixture_of_softmax_implicit(logits):
+    return torch.logsumexp(logits, dim=-2)
+
+
+def sinkhorn(logits, tol=1e-4, eps=1e-12):
+    shape = logits.shape
+    logits = logits.view(-1, shape[-1])
+    s, n = logits.shape
+    cost = torch.softmax(logits, dim=-2)
+    d0 = cost.new_ones(s, 1)
+    d1 = cost.new_ones(1, n)
+    d1_old = d1
+    error = cost.new_tensor(float("inf"))
+    while error > tol:
+        d0 = 1 / (torch.sum(d1 * cost, dim=-1, keepdim=True) + eps)
+        d1 = (s / n) / (torch.sum(d0 * cost, dim=-2, keepdim=True) + eps)
+        error = torch.mean(torch.abs(d1_old - d1))
+        d1_old = d1
+    out = d1 * cost * d0
+    return out.view(*shape)
+
+
 class Transformer(nn.Module):
     def __init__(self, depth, dim, hidden_dim, head_dim, dropout):
         super().__init__()
@@ -345,7 +375,9 @@ class Transformer(nn.Module):
         self.embed_drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([Block(dim, hidden_dim, head_dim, dropout) for _ in range(depth)])
         self.out_norm = RMSNorm((dim,))
+        # self.router = nn.Linear(dim, 1, bias=False)
         self.out_proj = nn.Linear(dim, 16384, bias=False)
+        self.image_embed.weight = self.out_proj.weight
 
     def init_cache(self, batch_size, seq_len, dtype=None, device=None):
         cache = [[] for _ in range(self.depth)]
@@ -370,29 +402,28 @@ class Transformer(nn.Module):
         x = x[:, -1:].contiguous() if cache and index > 0 else x
         x = self.embed_drop(x)
         cache = [None] * self.depth if cache is None else cache
+        xs = []
         for block, cache_block in zip(self.blocks, cache):
             # x = checkpoint(block, x, cache_block, index, enable=self.training)
             x = block(x, cache_block, index)
-        x = self.out_norm(x)
-        x = self.out_proj(x)
-        return x
-
-
-class TransformerEnsemble(nn.Module):
-    def __init__(self, models):
-        super().__init__()
-        self.models = nn.ModuleList(models)
-
-    def init_cache(self, *args, **kwargs):
-        return [model.init_cache(*args, **kwargs) for model in self.models]
-
-    def forward(self, x, y, cache=None, index=None):
-        xs = []
-        cache = [None] * len(self.models) if cache is None else cache
-        for model, cache_model in zip(self.models, cache):
-            xs.append(model(x, y, cache_model, index))
+            xs.append(x)
+            if len(xs) > 4:
+                xs.pop(0)
         x = torch.stack(xs, dim=-2)
-        x = torch.compile(torch.logsumexp)(x, dim=-2)
+        x = self.out_norm(x)
+        # scores = self.router(x).squeeze(-1)
+        # if self.training:
+        #     # g = torch.rand_like(scores, dtype=torch.float32).log_().nan_to_num_().neg_().log_().neg_()
+        #     # _, indices = torch.topk(scores + g, 2, dim=-1, sorted=False)
+        #     p = sinkhorn(scores)
+        #     _, indices = torch.topk(p, 2, dim=-1, sorted=False)
+        #     scores_topk = torch.gather(scores, -1, indices)
+        # else:
+        #     scores_topk, indices = torch.topk(scores, 2, dim=-1, sorted=False)
+        # x = torch.gather(x, -2, indices[..., None].expand(-1, -1, -1, self.dim))
+        x = self.out_proj(x)
+        # x = mixture_of_softmax(x, scores)
+        x = mixture_of_softmax_implicit(x)
         return x
 
 
@@ -429,7 +460,7 @@ def main():
         x = ae.decode(x)
         return (x + 1) / 2
 
-    model_raw = TransformerEnsemble([Transformer(8, 512, 1360, 64, dropout=0.0) for _ in range(4)]).to(device)
+    model_raw = Transformer(8, 512, 1360, 64, dropout=0.0).to(device)
     du.broadcast_tensors(model_raw.parameters())
     model_ema = deepcopy(model_raw).eval().requires_grad_(False)
     print0(f"Parameters: {sum(p.numel() for p in model_raw.parameters()):,}")
@@ -489,7 +520,7 @@ def main():
         if rank == 0:
             x = rearrange(x, "(nh nw) c h w -> c (nh h) (nw w)", nh=4, nw=4)
             x = torch.clamp(x, 0, 1)
-            TF.to_pil_image(x.cpu().float()).save(f"demo_artbench_036_{step:07}.png")
+            TF.to_pil_image(x.cpu().float()).save(f"demo_artbench_074_{step:07}.png")
 
     while True:
         sampler.set_epoch(epoch)

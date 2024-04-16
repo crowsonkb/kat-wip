@@ -7,10 +7,7 @@ import math
 from pathlib import Path
 
 from einops import rearrange
-import flash_attn
-from flash_attn.layers import rotary
 from ldm.util import instantiate_from_config
-from megablocks import grouped_gemm_util as gg
 from omegaconf import OmegaConf
 from PIL import Image
 import safetensors.torch
@@ -21,14 +18,14 @@ import torch.distributed.nn as dnn
 from torch.nn import functional as F
 from torch.utils import data
 import torch_dist_utils as du
-from torchvision import datasets, transforms
+# from torchvision import datasets, transforms
 from torchvision.transforms import functional as TF
 from tqdm import trange, tqdm
 
+from grouped_linear import GroupedLinear, group, ungroup
+
 print = tqdm.external_write_mode()(print)
 print0 = tqdm.external_write_mode()(du.print0)
-
-gmm = torch.compiler.disable(gg.ops.gmm)
 
 
 @contextmanager
@@ -223,6 +220,12 @@ def make_axial_pos(h, w, dtype=None, device=None):
 
 
 @compile_wrap
+def swiglu(x):
+    x, gate = x.chunk(2, dim=-1)
+    return x * F.silu(gate)
+
+
+@compile_wrap
 def linear_swiglu(x, weight, bias=None):
     x = x @ weight.mT
     if bias is not None:
@@ -261,33 +264,55 @@ class RMSNorm(nn.Module):
         return rms_norm(x, self.scale, self.eps)
 
 
-class DMoELinear(nn.Module):
-    def __init__(self, in_features, out_features, n_experts, bias=True):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.n_experts = n_experts
-        self.weight = nn.Parameter(torch.empty(n_experts, out_features, in_features))
-        for i in range(n_experts):
-            nn.init.xavier_uniform_(self.weight[i])
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(n_experts, out_features))
-        else:
-            self.bias = None
+def sinkhorn_loss(logits, n_iters):
+    logits = logits.flatten(0, -2)
+    log_a = -math.log(logits.shape[0])
+    log_b = -math.log(logits.shape[1])
+    logits = logits + (log_a - torch.logsumexp(logits, dim=1, keepdim=True))
+    a_dual = logits.new_zeros(logits.shape[0], 1)
+    b_dual = logits.new_zeros(1, logits.shape[1])
+    for _ in range(n_iters):
+        b_dual = log_b - torch.logsumexp(logits + a_dual, dim=0, keepdim=True)
+        a_dual = log_a - torch.logsumexp(logits + b_dual, dim=1, keepdim=True)
+    return torch.mean(a_dual) + torch.mean(b_dual)
 
-    def forward(self, x, ids):
-        out_shape = (*x.shape[:-1], self.out_features)
-        x = x.flatten(0, -2)
-        ids = ids.flatten()
-        ids_sorted, ids_indices = torch.sort(ids)
-        x_sorted = x[ids_indices]
-        batch_sizes = torch.bincount(ids_sorted, minlength=self.n_experts).cpu()
-        out = gmm(x_sorted.bfloat16(), self.weight.bfloat16(), batch_sizes, trans_b=True)
-        if self.bias is not None:
-            out += self.bias[ids_sorted].bfloat16()
-        out_real = torch.empty_like(out)
-        out_real.scatter_(0, ids_indices[..., None].expand_as(out), out)
-        return out_real.view(out_shape)
+
+@torch.compile
+def _apply_rotary_emb_inplace(x, theta, conj):
+    dtype = reduce(torch.promote_types, (x.dtype, theta.dtype, torch.float32))
+    d = theta.shape[-1]
+    assert d * 2 <= x.shape[-1]
+    x1, x2 = x[..., :d], x[..., d : d * 2]
+    x1_, x2_, theta = x1.to(dtype), x2.to(dtype), theta.to(dtype)
+    cos, sin = torch.cos(theta), torch.sin(theta)
+    sin = -sin if conj else sin
+    y1 = x1_ * cos - x2_ * sin
+    y2 = x2_ * cos + x1_ * sin
+    x1.copy_(y1)
+    x2.copy_(y2)
+
+
+class ApplyRotaryEmbeddingInplace(torch.autograd.Function):
+    @staticmethod
+    def forward(x, theta, conj):
+        _apply_rotary_emb_inplace(x, theta, conj=conj)
+        return x
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        _, theta, conj = inputs
+        ctx.save_for_backward(theta)
+        ctx.conj = conj
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        theta, = ctx.saved_tensors
+        _apply_rotary_emb_inplace(grad_output, theta, conj=not ctx.conj)
+        return grad_output, None, None
+
+
+def apply_rotary_emb_(x, theta):
+    return ApplyRotaryEmbeddingInplace.apply(x, theta, False)
 
 
 class SelfAttention(nn.Module):
@@ -301,41 +326,44 @@ class SelfAttention(nn.Module):
         self.out_proj = zero_init(nn.Linear(dim, dim, bias=False))
         log_min = math.log(math.pi)
         log_max = math.log(10 * math.pi)
-        freqs = torch.linspace(log_min, log_max, head_dim // 8).exp()
+        freqs = torch.linspace(log_min, log_max, (head_dim // 8) * (self.n_heads // 2) + 1)[:-1].exp()
+        freqs = freqs.view(head_dim // 8, self.n_heads // 2).T.contiguous()
         # TODO: allow changing image size
         pos = make_axial_pos(32, 32)
         # make room for the class token
         # TODO: use adanorm for this
         pos = torch.cat((torch.zeros(1, 2), pos))
-        theta_h = pos[..., 0:1] * freqs
-        theta_w = pos[..., 1:2] * freqs
-        theta = torch.cat((theta_h, theta_w), dim=-1)
-        self.register_buffer("cos", torch.cos(theta))
-        self.register_buffer("sin", torch.sin(theta))
+        theta_h_1 = pos[:-1, None, 0:1] * freqs
+        theta_w_1 = pos[:-1, None, 1:2] * freqs
+        theta_h_2 = pos[1:, None, 0:1] * freqs
+        theta_w_2 = pos[1:, None, 1:2] * freqs
+        theta_1 = torch.cat((theta_h_1, theta_w_1), dim=-1)
+        theta_2 = torch.cat((theta_h_2, theta_w_2), dim=-1)
+        theta = torch.cat((theta_1, theta_2), dim=-2)
+        self.register_buffer("theta", theta)
 
     def forward(self, x, cache=None, index=None):
         skip = x
         x = self.norm(x)
         qkv = self.qkv_proj(x).view(*x.shape[:2], 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.view(*x.shape[:2], 3, self.n_heads, self.head_dim).transpose(1, 3).unbind(2)
         if cache is None:
-            qkv = rotary.apply_rotary_emb_qkv_(qkv, self.cos.to(qkv), self.sin.to(qkv))
-            x = flash_attn.flash_attn_qkvpacked_func(qkv, self.dropout_p if self.training else 0, causal=True)
+            theta = self.theta[: x.shape[1]].transpose(0, 1)
+            q = apply_rotary_emb_(q, theta)
+            k = apply_rotary_emb_(k, theta)
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout_p if self.training else 0.0, is_causal=True)
         else:
             assert not (x.shape[1] > 1 and index != 0)
-            end_index = index + x.shape[1]
-            q, k, v = qkv.unbind(2)
-            q = rotary.apply_rotary_emb(
-                q, self.cos[index:end_index].to(q), self.sin[index:end_index].to(q), inplace=True
-            )
-            k = rotary.apply_rotary_emb(
-                k, self.cos[index:end_index].to(q), self.sin[index:end_index].to(q), inplace=True
-            )
-            cache[0][:, index:end_index] = k
-            cache[1][:, index:end_index] = v
-            x = flash_attn.flash_attn_func(
-                q, cache[0][:, :end_index], cache[1][:, :end_index], self.dropout_p if self.training else 0, causal=index == 0
-            )
-        x = x.view(*x.shape[:2], -1)
+            end_index = index + 1
+            theta = self.theta[index:end_index].transpose(0, 1)
+            q = apply_rotary_emb_(q, theta)
+            k = apply_rotary_emb_(k, theta)
+            cache[0][:, :, index:end_index] = k
+            cache[1][:, :, index:end_index] = v
+            k_in = cache[0][:, :, :end_index]
+            v_in = cache[1][:, :, :end_index]
+            x = F.scaled_dot_product_attention(q, k_in, v_in, is_causal=index == 0)
+        x = x.transpose(1, 2).reshape(*skip.shape[:2], -1)
         x = self.out_proj(x)
         return x + skip
 
@@ -355,28 +383,54 @@ class FeedForward(nn.Module):
         return x + skip
 
 
+_all_gather = torch.compiler.disable(dnn.all_gather)
+
+
+class Router(nn.Module):
+    def __init__(self, dim, n, k, act=None):
+        super().__init__()
+        self.n = n
+        self.k = k
+        self.linear = nn.Linear(dim, n, bias=False)
+        self.act = nn.Softmax(dim=-1) if act is None else act
+
+    def forward(self, x):
+        scores = self.linear(x)
+        if self.training:
+            scores_all = torch.cat(_all_gather(scores)).flatten(0, -2)
+            aux_loss = sinkhorn_loss(scores_all, 8)
+            scores_g = scores  # + gumbel_like(scores)
+        else:
+            aux_loss = None
+            scores_g = scores
+        c, indices = torch.topk(scores_g, self.k, dim=-1)
+        c = torch.softmax(scores, dim=-1).gather(-1, indices)
+        # c = c / torch.sum(c.detach(), dim=-1, keepdim=True)
+        return c, indices, aux_loss
+
+
 class MoEFeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, n_experts, k):
         super().__init__()
+        self.n_experts = n_experts
         self.k = k
         self.norm = RMSNorm((dim,))
-        self.router = nn.Linear(dim, n_experts, bias=False)
-        self.up = DMoELinear(dim, hidden_dim * 2, n_experts, bias=False)
-        self.act = nn.SiLU()
-        self.down = zero_init(DMoELinear(hidden_dim, dim, n_experts, bias=False))
+        self.router = Router(dim, n_experts, k)
+        self.up = GroupedLinear(dim, hidden_dim * 2, n_experts, bias=False)
+        self.down = zero_init(GroupedLinear(hidden_dim, dim, n_experts, bias=False))
 
     def forward(self, x):
         skip = x
         x = self.norm(x)
-        scores = self.router(x).float()
-        scores_topk, score_indices = torch.topk(scores, self.k, dim=-1)
-        weights_topk = torch.softmax(scores_topk, dim=-1)
+        c, ids, aux_loss = self.router(x)
         x = x[..., None, :].expand(-1, -1, self.k, -1)
-        x, gate = self.up(x, score_indices).chunk(2, dim=-1)
-        x = x * self.act(gate)
-        x = self.down(x, score_indices)
-        x = torch.sum(x * weights_topk[..., None], dim=-2)
-        return x + skip
+        x, info = group(x, ids, self.n_experts)
+        x = self.up(x, info)
+        x = swiglu(x)
+        x = self.down(x, info)
+        x = ungroup(x, info)
+        x = torch.sum(x * c[..., None], dim=-2)
+        return x + skip, aux_loss
 
 
 class Block(nn.Module):
@@ -384,187 +438,184 @@ class Block(nn.Module):
         super().__init__()
         self.attn = SelfAttention(dim, head_dim, dropout)
         self.ff = FeedForward(dim, hidden_dim)
+        # self.ff = MoEFeedForward(dim, hidden_dim, 8, 2)
+        # self.ff.compile()
 
     def forward(self, x, cache=None, index=None):
         x = self.attn(x, cache, index)
         x = self.ff(x)
-        return x
+        # x, aux_loss = self.ff(x)
+        return x, None  # aux_loss
 
 
-class MLPHead(nn.Module):
-    def __init__(self, dim, vocab_size, hidden_dim):
-        super().__init__()
-        self.up = nn.Linear(dim, hidden_dim, bias=False)
-        self.act = nn.GELU()
-        self.out = nn.Linear(hidden_dim, vocab_size, bias=False)
-        nn.init.zeros_(self.out.weight)
+class MixtureOfSoftmaxes(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, p):
+        with torch.cuda.amp.autocast(enabled=False):
+            x = F.log_softmax(x, dim=-1)
+            p = F.log_softmax(p, dim=-1)
+            out = torch.logsumexp(x + p[..., None], dim=-2)
+            ctx.save_for_backward(x, p, out)
+            return out
 
-    def forward(self, x):
-        x = self.up(x)
-        x = self.act(x)
-        x = self.out(x)
-        return x
-
-
-class MixtureOfSoftmaxHead(nn.Module):
-    def __init__(self, dim, vocab_size, hidden_dim, n_experts, k):
-        super().__init__()
-        self.k = k
-        self.router = nn.Linear(dim, n_experts, bias=False)
-        self.up = DMoELinear(dim, hidden_dim, n_experts, bias=False)
-        self.act = nn.GELU()
-        self.out = DMoELinear(hidden_dim, vocab_size, n_experts, bias=False)
-        nn.init.zeros_(self.out.weight)
-
-    def forward(self, x):
-        scores = self.router(x).float()
-        scores_topk, score_indices = torch.topk(scores, self.k, dim=-1)
-        scores_topk = scores_topk - torch.logsumexp(scores_topk, dim=-1, keepdim=True)
-        x = x[..., None, :].expand(-1, -1, self.k, -1)
-        x = self.up(x, score_indices)
-        x = self.act(x)
-        x = self.out(x, score_indices)
-        x = x - torch.logsumexp(x, dim=-1, keepdim=True)
-        x = torch.logsumexp(x + scores_topk[..., None], dim=-2)
-        return x
+    @staticmethod
+    def backward(ctx, grad_output):
+        with torch.cuda.amp.autocast(enabled=False):
+            x, p, out = ctx.saved_tensors
+            grad_x = torch.exp(x + p[..., None] - out[..., None, :]) * grad_output[..., None, :]
+            grad_p = torch.sum(grad_x, dim=-1)
+            grad_x -= torch.exp(x) * torch.sum(grad_x, dim=-1, keepdim=True)
+            grad_p -= torch.exp(p) * torch.sum(grad_p, dim=-1, keepdim=True)
+            return grad_x, grad_p
 
 
-class MoEHead__(nn.Module):
-    def __init__(self, dim, vocab_size, hidden_dim, n_experts, k):
-        super().__init__()
-        self.k = k
-        self.router = nn.Linear(dim, n_experts, bias=False)
-        # self.up = DMoELinear(dim, hidden_dim, n_experts, bias=False)
-        self.gate = DMoELinear(dim, dim, n_experts, bias=False)
-        self.act = nn.GELU()
-        self.out = DMoELinear(dim, vocab_size, n_experts, bias=False)
+def mixture_of_softmaxes(x, p):
+    """Returns log probabilities of a mixture of k softmaxes.
 
-    def forward(self, x):
-        scores = self.router(x).float()
-        scores_topk, score_indices = torch.topk(scores, self.k, dim=-1)
-        weights_topk = torch.softmax(scores_topk, dim=-1)
-        x = x[..., None, :].expand(-1, -1, self.k, -1)
-        # x = self.up(x, score_indices)
-        gate = self.gate(x, score_indices)
-        x = x * self.act(gate)
-        x = self.out(x, score_indices)
-        x = torch.sum(x * weights_topk[..., None], dim=-2)
-        return x
+    Args:
+        x: The input logits, shape (..., k, n_classes).
+        p: The mixture logits, shape (..., k).
+
+    Returns:
+        The log probabilities, shape (..., n_classes).
+    """
+    return MixtureOfSoftmaxes.apply(x, p.to(x.dtype))
 
 
 class MoEHead(nn.Module):
-    def __init__(self, dim, vocab_size, n_experts, k):
+    def __init__(self, dim, hidden_dim, vocab_size, n, k):
         super().__init__()
+        self.n = n
         self.k = k
-        self.router = nn.Linear(dim, n_experts, bias=False)
-        self.up = DMoELinear(dim, dim * 8 // 3 * 2, n_experts)
-        self.act = nn.GELU()
-        self.down = DMoELinear(dim * 8 // 3, dim, n_experts, bias=False)
-        self.proj = DMoELinear(dim, vocab_size, n_experts, bias=False)
+        self.router = Router(dim, n, k, act=nn.Identity())
+        self.up = GroupedLinear(dim, hidden_dim * 2, n, bias=False)
+        self.down = GroupedLinear(hidden_dim, dim, n, bias=False)
+        self.proj = GroupedLinear(dim, vocab_size, n, bias=False)
+
+    def embed(self, x):
+        return F.embedding(x, self.proj.weight.mean(dim=0))
 
     def forward(self, x):
-        scores = self.router(x)
-        scores_topk, indices = torch.topk(scores, self.k, dim=-1)
-        scores_topk = scores_topk - torch.logsumexp(scores_topk, dim=-1, keepdim=True)
-        x = skip = x[..., None, :].expand(-1, -1, self.k, -1)
-        x, gate = self.up(x, indices).chunk(2, dim=-1)
-        x = x * self.act(gate)
-        x = self.down(x, indices)
+        c, ids, aux_loss = self.router(x)
+        x = x[..., None, :].expand(-1, -1, self.k, -1)
+        x, info = group(x, ids, self.n)
+        skip = x
+        x = self.up(x, info)
+        x = swiglu(x)
+        x = self.down(x, info)
         x = x + skip
-        x = self.proj(x, indices)
-        x = x - torch.logsumexp(x, dim=-1, keepdim=True)
-        x = torch.logsumexp(x + scores_topk[..., None], dim=-2)
+        x = self.proj(x, info)
+        x = ungroup(x, info)
+        x = mixture_of_softmaxes(x, c)
+        return x, aux_loss
+
+
+class MoEHead2(nn.Module):
+    def __init__(self, dim, hidden_dim, n_classes, n_softmaxes):
+        super().__init__()
+        self.dim = dim
+        self.hidden_dim = hidden_dim
+        self.n_classes = n_classes
+        self.n_softmaxes = n_softmaxes
+        self.router = nn.Linear(dim, n_softmaxes, bias=False)
+        self.up = GroupedLinear(dim, hidden_dim * 2, n_softmaxes, bias=False)
+        self.down = GroupedLinear(hidden_dim, dim, n_softmaxes, bias=False)
+        self.proj = GroupedLinear(dim, n_classes, n_softmaxes, bias=False)
+
+    def embed(self, x):
+        weight = rearrange(self.proj.weight, "n o i -> o (n i)")
+        embeds = rearrange(F.embedding(x, weight), "... (n i) -> ... n i", n=self.n_softmaxes)
+        return torch.mean(embeds, dim=-2)
+
+    def forward(self, x):
+        p = self.router(x)
+        x = x[..., None, :].expand(-1, -1, self.n_softmaxes, -1)
+        ids = torch.arange(self.n_softmaxes, device=x.device).expand_as(p)
+        x, info = group(x, ids, self.n_softmaxes)
+        skip = x
+        x = self.up(x, info)
+        x = swiglu(x)
+        x = self.down(x, info)
+        x = x + skip
+        x = self.proj(x, info)
+        x = ungroup(x, info)
+        x = mixture_of_softmaxes(x, p)
         return x
 
 
-class MoEHead_(nn.Module):
-    def __init__(self, dim, vocab_size, n_experts, k):
+class MoSHead(nn.Module):
+    def __init__(self, in_features, out_features, n_softmaxes):
         super().__init__()
-        self.k = k
-        self.router = nn.Linear(dim, n_experts, bias=False)
-        self.up = DMoELinear(dim, dim * 2, n_experts)
-        self.act = nn.GELU()
-        self.proj = DMoELinear(dim * 2, vocab_size, n_experts, bias=False)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.n_softmaxes = n_softmaxes
+        self.router = nn.Linear(in_features, n_softmaxes, bias=False)
+        self.proj = nn.Linear(in_features, n_softmaxes * out_features, bias=False)
+
+    def extra_repr(self):
+        return f"in_features={self.in_features}, out_features={self.out_features}, n_softmaxes={self.n_softmaxes}"
+
+    def embed(self, x):
+        weight = rearrange(self.proj.weight, "(n o) i -> o (n i)", n=self.n_softmaxes)
+        embeds = rearrange(F.embedding(x, weight), "... (n i) -> ... n i", n=self.n_softmaxes)
+        return torch.mean(embeds, dim=-2)
 
     def forward(self, x):
-        scores = self.router(x)
-        scores_topk, indices = torch.topk(scores, self.k, dim=-1)
-        # weights_topk = torch.softmax(scores_topk, dim=-1)
-        scores_topk = scores_topk - torch.logsumexp(scores_topk, dim=-1, keepdim=True)
+        p = self.router(x)
+        x = self.proj(x).view(*x.shape[:2], self.n_softmaxes, self.out_features)
+        return mixture_of_softmaxes(x, p)
+
+
+class MoSHeadTopK(nn.Module):
+    def __init__(self, in_features, out_features, n_softmaxes, k):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.n_softmaxes = n_softmaxes
+        self.k = k
+        self.router = Router(in_features, n_softmaxes, k, act=nn.Identity())
+        self.proj = GroupedLinear(in_features, out_features, n_softmaxes, bias=False)
+
+    def extra_repr(self):
+        return f"in_features={self.in_features}, out_features={self.out_features}, n_softmaxes={self.n_softmaxes}, k={self.k}"
+
+    def embed(self, x):
+        weight = rearrange(self.proj.weight, "n o i -> o (n i)")
+        embeds = rearrange(F.embedding(x, weight), "... (n i) -> ... n i", n=self.n_softmaxes)
+        return torch.mean(embeds, dim=-2)
+
+    def forward(self, x):
+        p, ids, aux_loss = self.router(x)
         x = x[..., None, :].expand(-1, -1, self.k, -1)
-        x = self.up(x, indices)
-        x = self.act(x)
-        x = self.proj(x, indices)
-        x = x - torch.logsumexp(x, dim=-1, keepdim=True)
-        x = torch.logsumexp(x + scores_topk[..., None], dim=-2)
+        x, info = group(x, ids, self.n_softmaxes)
+        x = self.proj(x, info)
+        x = ungroup(x, info)
+        x = mixture_of_softmaxes(x, p)
+        return x, aux_loss
+
+
+class MoSMLPHead(nn.Module):
+    def __init__(self, in_features, hidden_dim, out_features, n_softmaxes):
+        super().__init__()
+        self.in_features = in_features
+        self.hidden_dim = hidden_dim
+        self.out_features = out_features
+        self.n_softmaxes = n_softmaxes
+        self.router = nn.Linear(in_features, n_softmaxes, bias=False)
+        self.up = GroupedLinear(in_features, hidden_dim, n_softmaxes, bias=False)
+        self.proj = GroupedLinear(hidden_dim, out_features, n_softmaxes, bias=False)
+
+    def forward(self, x):
+        p = self.router(x)
+        x = x[..., None, :].expand(-1, -1, self.n_softmaxes, -1)
+        ids = torch.arange(self.n_softmaxes, device=x.device).expand_as(p)
+        x, info = group(x, ids, self.n_softmaxes)
+        x = self.up(x, info)
+        x = F.gelu(x)
+        x = self.proj(x, info)
+        x = ungroup(x, info)
+        x = mixture_of_softmaxes(x, p)
         return x
-
-
-class Head2(nn.Module):
-    def __init__(self, dim, vocab_size, n_clusters, k):
-        super().__init__()
-        self.k = k
-        self.router = nn.Linear(dim, n_clusters - 1, bias=False)
-        self.proj = DMoELinear(dim, vocab_size, n_clusters, bias=False)
-
-    @staticmethod
-    def dist2(x, y):
-        x_sq = torch.sum(x**2, dim=-1)[..., :, None]
-        y_sq = torch.sum(y**2, dim=-1)[..., None, :]
-        return x_sq + y_sq - 2 * x @ y.mT
-
-    def forward(self, x):
-        scores = -self.dist2(x, self.router.weight)
-        scores = torch.cat((torch.zeros_like(scores[..., :1]), scores), dim=-1)
-        scores_topk, indices = torch.topk(scores, self.k, dim=-1)
-        scores_topk = scores_topk - torch.logsumexp(scores_topk, dim=-1, keepdim=True)
-        x = x[..., None, :].expand(-1, -1, self.k, -1)
-        x = self.proj(x, indices)
-        x = x - torch.logsumexp(x, dim=-1, keepdim=True)
-        x = torch.logsumexp(x + scores_topk[..., None], dim=-2)
-        return x
-
-
-class Head3(nn.Module):
-    def __init__(self, dim, vocab_size, n, k):
-        super().__init__()
-        self.k = k
-        self.router = nn.Linear(dim, n, bias=False)
-        self.proj = DMoELinear(dim, vocab_size, n, bias=False)
-
-    @staticmethod
-    def sinkhorn(logits, tol=1e-4, eps=1e-12):
-        shape = logits.shape
-        logits = logits.view(-1, shape[-1])
-        s, n = logits.shape
-        cost = torch.exp(logits)
-        d0 = cost.new_ones(s, 1)
-        d1 = cost.new_ones(1, n)
-        d1_old = d1
-        error = cost.new_tensor(float("inf"))
-        while error > tol:
-            d0 = 1 / (torch.sum(d1 * cost, dim=-1, keepdim=True) + eps)
-            d1 = (s / n) / (torch.sum(d0 * cost, dim=-2, keepdim=True) + eps)
-            error = torch.mean(torch.abs(d1_old - d1))
-            d1_old = d1
-        out = d1 * cost * d0
-        return out.view(*shape)
-
-    def forward(self, x):
-        scores = self.router(x)
-        weights = torch.softmax(scores, dim=-1)
-        if self.training:
-            # weights = self.sinkhorn(scores)
-            p = torch.mean(weights.flatten(0, -2), dim=0)
-            logq = -math.log(weights.shape[-1])
-            aux_loss = torch.sum(p * (torch.log(p) - logq), dim=-1)
-        weights_topk, indices = torch.topk(weights, self.k, dim=-1)
-        weights_topk = weights_topk / torch.sum(weights_topk, dim=-1, keepdim=True)
-        x = x[..., None, :].expand(-1, -1, self.k, -1)
-        x = self.proj(x, indices)
-        x = x - torch.logsumexp(x, dim=-1, keepdim=True)
-        x = torch.logsumexp(x + torch.log(weights_topk)[..., None], dim=-2)
-        return (x, aux_loss) if self.training else x
 
 
 class Transformer(nn.Module):
@@ -580,10 +631,11 @@ class Transformer(nn.Module):
         self.embed_drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([Block(dim, hidden_dim, head_dim, dropout) for _ in range(depth)])
         self.out_norm = RMSNorm((dim,))
-        # self.out_head = nn.Linear(dim, 16384, bias=False)
-        # self.out_head = MLPHead(dim, 16384, dim * 4)
-        # self.out_head = MoEHead(dim, 16384, n_experts=3, k=3)
-        self.out_head = Head3(dim, 16384, 8, 2)
+        self.out_head = nn.Linear(dim, 16384, bias=False)
+        # self.image_embed.weight = self.out_head.weight
+        self.out_head = MoEHead2(dim, hidden_dim, 16384, 4)
+        # self.out_head = MoSHead(dim, 16384, 4)
+        # self.out_head = MoSMLPHead(dim, dim * 2, 16384, 4)
         self.out_head.compile()
 
     def init_cache(self, batch_size, seq_len, dtype=None, device=None):
@@ -593,8 +645,8 @@ class Transformer(nn.Module):
                 item.append(
                     torch.zeros(
                         batch_size,
-                        seq_len,
                         self.n_heads,
+                        seq_len,
                         self.head_dim,
                         dtype=dtype,
                         device=self.class_embed.weight.device if device is None else device,
@@ -604,23 +656,57 @@ class Transformer(nn.Module):
 
     def forward(self, x, y, cache=None, index=None):
         # x = self.image_embed(x)
-        x = F.embedding(x, self.out_head.proj.weight[0])
+        x = self.out_head.embed(x)
         y = self.class_embed(y)
         x = torch.cat((y[:, None], x), dim=1)
         x = x[:, -1:].contiguous() if cache and index > 0 else x
         x = self.embed_drop(x)
         cache = [None] * self.depth if cache is None else cache
-        # xs = []
+        aux_losses = []
         for block, cache_block in zip(self.blocks, cache):
-            # x = checkpoint(block, x, cache_block, index, enable=self.training)
-            x = block(x, cache_block, index)
-            # xs.append(x)
-            # if len(xs) > 2:
-            #     xs.pop(0)
+            # x, aux_loss = checkpoint(block, x, cache_block, index, enable=self.training)
+            x, aux_loss = block(x, cache_block, index)
+            aux_losses.append(aux_loss)
         x = self.out_norm(x)
-        # x = torch.stack(xs, dim=-2)
         x = self.out_head(x)
-        return x
+        # x, aux_loss = self.out_head(x)
+        aux_losses.append(aux_loss)
+        aux_losses = [l for l in aux_losses if l is not None]
+        aux_loss = torch.mean(torch.stack(aux_losses)) if aux_losses and self.training else x.new_tensor(0.0)
+        return x, aux_loss
+
+
+def apply_top_p(logits, p):
+    """Apply top-p to logits."""
+    probs = torch.softmax(logits, dim=-1)
+    probs_sorted, indices = torch.sort(probs, dim=-1, descending=True, stable=True)
+    probs_cumsum = torch.cumsum(probs_sorted, dim=-1)
+    drop = probs_cumsum[..., :-1] >= p
+    drop = torch.cat((drop.new_zeros(*drop.shape[:-1], 1), drop), dim=-1)
+    drop_unsorted = torch.empty_like(drop).scatter_(-1, indices, drop)
+    return torch.masked_fill(logits, drop_unsorted, float("-inf"))
+
+
+def apply_typical_p(logits, p):
+    """Apply typical-p to logits."""
+    logprobs = F.log_softmax(logits, dim=-1)
+    probs = torch.exp(logprobs)
+    entr = -torch.nansum(logprobs * probs, dim=-1, keepdim=True)
+    shifted = torch.abs(logprobs + entr)
+    _, indices = torch.sort(shifted, stable=True)
+    probs_sorted = torch.gather(probs, -1, indices)
+    probs_cumsum = torch.cumsum(probs_sorted, dim=-1)
+    drop = probs_cumsum[..., :-1] >= p
+    drop = torch.cat((drop.new_zeros(*drop.shape[:-1], 1), drop), dim=-1)
+    drop_unsorted = torch.empty_like(drop).scatter_(-1, indices, drop)
+    return torch.masked_fill(logits, drop_unsorted, float("-inf"))
+
+
+def apply_min_p(logits, p):
+    """Apply min-p to logits."""
+    top_logits, _ = torch.max(logits, dim=-1, keepdim=True)
+    drop = logits < top_logits + torch.log(1 - logits.new_tensor(p))
+    return torch.masked_fill(logits, drop, float("-inf"))
 
 
 def main():
@@ -632,7 +718,7 @@ def main():
     world_size = dist.get_world_size()
 
     base_path = "/home/kat/text-to-image/latent-diffusion"
-    # base_path = "/weka/kat/ar_image/latent-diffusion"
+    # base_path = "/weka2/kat/ar_image/latent-diffusion"
     config_path = f"{base_path}/models/first_stage_models/vq-f16/config.yaml"
     model_path = f"{base_path}/models/first_stage_models/vq-f16/model.ckpt"
     ae = load_vqgan_model(config_path, model_path).to(device)
@@ -686,13 +772,14 @@ def main():
             wd.append(param)
     groups = [{"params": wd}, {"params": no_wd, "weight_decay": 0}]
     opt = optim.AdamW(groups, lr=6e-4, betas=(0.9, 0.95), weight_decay=0.1)
+    sched = optim.lr_scheduler.LambdaLR(opt, lambda i: min(1, i / 250))
     ema_sched = EMAWarmup(power=2 / 3, max_value=0.999)
 
     epoch = 0
     step = 0
 
     @torch.no_grad()
-    def sample(model, y, tau=1.0, disable=False):
+    def sample(model, y, tau=1.0, top_p=1.0, disable=False):
         n = y.shape[0]
         n_proc = n // world_size
         x = torch.zeros(n_proc, 0, dtype=torch.long, device=device)
@@ -702,12 +789,15 @@ def main():
         entr_x = torch.zeros(n_proc, 0, dtype=torch.float32, device=device)
         for _ in trange(32 * 32, disable=rank != 0 or disable):
             with torch.cuda.amp.autocast(dtype=torch.bfloat16), eval_mode(model):
-                logits = model(x, y, cache, index).float()
-            sample = sample_categorical(logits, tau=tau)
-            x = torch.cat((x, sample), dim=1)
+                logits, _ = model(x, y, cache, index)
+            logits = logits.float()
             logprobs = F.log_softmax(logits, dim=-1)
             entr_tok = -torch.sum(logprobs.exp() * logprobs, dim=-1)
             entr_x = torch.cat((entr_x, entr_tok), dim=1)
+            if top_p < 1.0:
+                logits = apply_top_p(logits, top_p)
+            sample = sample_categorical(logits, tau=tau)
+            x = torch.cat((x, sample), dim=1)
             index += 1
         x = torch.cat(dnn.all_gather(x))
         entr_x = torch.cat(dnn.all_gather(entr_x))
@@ -716,34 +806,36 @@ def main():
     def demo():
         y = torch.randint(10, (16,), device=device)
         dist.broadcast(y, 0)
-        x, entr = sample(model_ema, y, tau=1.0)
+        x, entr = sample(model_ema, y, tau=1.0, top_p=1.0)
         print0(f"Mean policy entropy: {entr.mean().item():g}")
         x = rearrange(x, "b (h w) -> b h w", h=32, w=32)
         x = decode(x)
         if rank == 0:
             x = rearrange(x, "(nh nw) c h w -> c (nh h) (nw w)", nh=4, nw=4)
             x = torch.clamp(x, 0, 1)
-            TF.to_pil_image(x.cpu().float()).save(f"demo_artbench_059_{step:07}.png")
+            TF.to_pil_image(x.cpu().float()).save(f"demo_artbench_202_{step:07}.png")
 
     while True:
         sampler.set_epoch(epoch)
         for x, y in tqdm(dataloader, disable=rank > 0):
-            if step % 500 == 0:
+            if step > 0 and step % 500 == 0:
                 demo()
             x = x.long().to(device)
             y = y.long().to(device)
             y_drop = torch.where(torch.rand_like(y, dtype=torch.float32) < 0.1, 10, y)
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 logits, aux_loss = model(x[:, :-1], y_drop)
-            loss = F.cross_entropy(logits.mT, x)
+                xent_loss = torch.compile(F.cross_entropy)(logits.mT, x)
+            loss = xent_loss  # + 0.02 * aux_loss
+            aux_loss = loss.new_tensor(0.0)
             opt.zero_grad()
             loss.backward()
             opt.step()
+            sched.step()
             ema_update(model_raw, model_ema, ema_sched.get_value())
             ema_sched.step()
-            dist.all_reduce(loss, dist.ReduceOp.AVG)
-            dist.all_reduce(aux_loss, dist.ReduceOp.AVG)
-            print0(f"epoch: {epoch}, step: {step}, loss: {loss.item():g}, aux_loss: {aux_loss.item():g}")
+            dist.all_reduce_coalesced([loss, xent_loss, aux_loss], dist.ReduceOp.AVG)
+            print0(f"epoch: {epoch}, step: {step}, loss: {loss.item():g}, xent: {xent_loss.item():g}, aux: {aux_loss.item():g}")
             step += 1
 
         epoch += 1
